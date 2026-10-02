@@ -1,16 +1,22 @@
 name: org-event
-# The T3b router (contract /tmp/webhook-relay/contract.md §3, amended by §7 and §8): the relay
-# (T3a) dispatches this with 5 string IDs taken from a signed webhook payload. Nothing here trusts
-# those IDs -- the `verify` job re-fetches the comment, the PR, and org membership itself through
-# gateway/trigger.py before anything is allowed to run. §8: the trigger word is `@review`, and the
-# comment may also pick a MODEL/EFFORT, resolved against gateway/models.json in this checkout and
-# passed on as `backend`/`model`/`effort`. A failed check ends the job successfully with a log
-# line; nothing is posted and nothing is revealed to the commenter.
+# The T3b router (contract /tmp/webhook-relay/contract.md §3, amended by §7, §8 and §10): the
+# relay (T3a) dispatches this with 5 string IDs taken from a signed webhook payload. Nothing here
+# trusts those IDs -- the `verify` job re-fetches the comment, the PR, and org membership itself
+# through gateway/trigger.py before anything is allowed to run. §8: the trigger word is `@review`,
+# and the comment may also pick a MODEL/EFFORT, resolved against gateway/models.json in this
+# checkout and passed on as `backend`/`model`/`effort`. A failed check ends the job successfully
+# with a log line; nothing is posted and nothing is revealed to the commenter -- EXCEPT §10's
+# `help` job, which fires only when every other check passed but the command itself was malformed.
 #
 # §7 "Validate inputs BEFORE any mint": the `validate` step runs trigger.py's format + owner-pin
 # checks (no App token, no network) before the mint step exists at all, and hands the mint step
 # the validated repo name. The mint itself always pins `owner: ${{ github.repository_owner }}`,
 # never anything taken from the inputs.
+#
+# §10: the handler (prepare/review/post) is inlined here rather than a separate ai-review.yml
+# workflow_call -- Environment secrets don't resolve across a workflow_call boundary. Job graph:
+# verify -> {help, prepare -> review -> post}. help and the prepare/review/post chain are mutually
+# exclusive (gated on opposite verified/help values) and never both run for one dispatch.
 
 on:
   workflow_dispatch:
@@ -65,6 +71,10 @@ jobs:
       backend: ${{ steps.run-trigger.outputs.backend }}
       model: ${{ steps.run-trigger.outputs.model }}
       effort: ${{ steps.run-trigger.outputs.effort }}
+      help: ${{ steps.run-trigger.outputs.help }}
+      reason: ${{ steps.run-trigger.outputs.reason }}
+      attempted_model: ${{ steps.run-trigger.outputs.attempted_model }}
+      attempted_effort: ${{ steps.run-trigger.outputs.attempted_effort }}
     steps:
       - name: Check out board-app
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -128,6 +138,45 @@ jobs:
           else
             echo "verify: failed ($REASON)"
           fi
+
+  help:
+    needs: verify
+    if: needs.verify.outputs.help == 'true'
+    runs-on: ubuntu-latest
+    environment: gateway
+    permissions:
+      contents: read
+    env:
+      REPOSITORY: ${{ needs.verify.outputs.repository }}
+      PR_NUMBER: ${{ needs.verify.outputs.pr_number }}
+      COMMENT_ID: ${{ needs.verify.outputs.comment_id }}
+      REQUESTER: ${{ needs.verify.outputs.requester }}
+      REASON: ${{ needs.verify.outputs.reason }}
+      ATTEMPTED_MODEL: ${{ needs.verify.outputs.attempted_model }}
+      ATTEMPTED_EFFORT: ${{ needs.verify.outputs.attempted_effort }}
+    steps:
+      - name: Check out board-app (trusted code only, never the target repo)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Mint Board App token (pull_requests write only) for the target repo
+        id: mint
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOARD_APP_ID }}
+          private-key: ${{ secrets.BOARD_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ env.REPOSITORY }}
+          permission-pull-requests: write
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Render and upsert the help reply
+        env:
+          GH_TOKEN: ${{ steps.mint.outputs.token }}
+          BOARD_APP_BOT_LOGIN: ${{ steps.mint.outputs.app-slug && format('{0}[bot]', steps.mint.outputs.app-slug) }}
+          DRY_RUN: ${{ vars.AI_REVIEW_LIVE == 'true' && '0' || '1' }}
+        run: python3 gateway/help_reply.py "$REASON" "$ATTEMPTED_MODEL" "$ATTEMPTED_EFFORT" "$REPOSITORY" "$PR_NUMBER" "$COMMENT_ID" "$REQUESTER"
 
   prepare:
     needs: verify
@@ -280,5 +329,5 @@ jobs:
       - name: Render and upsert the review comment
         env:
           GH_TOKEN: ${{ steps.mint.outputs.token }}
-          BOARD_APP_BOT_LOGIN: ${{ steps.mint.outputs.app-slug }}[bot]
+          BOARD_APP_BOT_LOGIN: ${{ steps.mint.outputs.app-slug && format('{0}[bot]', steps.mint.outputs.app-slug) }}
         run: python3 gateway/ai_review_post.py out.md "$HEAD_SHA" "$REQUESTER" "$COMMENT_ID" "$REPOSITORY" "$PR_NUMBER" "$MODEL" "$EFFORT"

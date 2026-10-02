@@ -192,15 +192,18 @@ class VerifyTests(unittest.TestCase):
             self.run_verify(responses=responses)
         self.assertEqual(ctx.exception.reason, "command:no_match")
 
-    def test_check3_four_tokens_is_not_a_command(self):
+    def test_check3_four_tokens_is_a_malformed_command_not_a_non_command(self):
+        # §10: 4 tokens after a real `@review` is a malformed ATTEMPT, so it's help-eligible --
+        # unlike command:no_match (wrong first token), it does not raise, it returns.
         responses = default_responses({
             ("GET", f"/repos/{REPOSITORY}/issues/comments/{COMMENT_ID}"): (
                 200, comment_body(body="@review opus high extra"),
             ),
         })
-        with self.assertRaises(trigger.VerifyFailure) as ctx:
-            self.run_verify(responses=responses)
-        self.assertEqual(ctx.exception.reason, "command:no_match")
+        result = self.run_verify(responses=responses)
+        self.assertEqual(result["verified"], "false")
+        self.assertEqual(result["reason"], "command:grammar")
+        self.assertEqual(result["help"], "true")
 
     def test_check3_command_must_be_first_line(self):
         # Only the FIRST line counts, trimmed -- trailing lines never rescue (or poison) a
@@ -271,14 +274,18 @@ class VerifyTests(unittest.TestCase):
 
     def test_check3_max_effort_no_longer_allowed_for_anthropic(self):
         # §9: anthropic's efforts dropped xhigh/max -- "max" is no longer anything's effort.
+        # §10: an invalid effort is help-eligible, so verify() returns rather than raising.
         responses = default_responses({
             ("GET", f"/repos/{REPOSITORY}/issues/comments/{COMMENT_ID}"): (
                 200, comment_body(body="@review opus max"),
             ),
         })
-        with self.assertRaises(trigger.VerifyFailure) as ctx:
-            self.run_verify(responses=responses)
-        self.assertEqual(ctx.exception.reason, "command:effort")
+        result = self.run_verify(responses=responses)
+        self.assertEqual(result["verified"], "false")
+        self.assertEqual(result["reason"], "command:effort")
+        self.assertEqual(result["help"], "true")
+        self.assertEqual(result["attempted_model"], "opus")
+        self.assertEqual(result["attempted_effort"], "max")
 
     def test_check3_exact_model_value_with_explicit_effort(self):
         responses = default_responses({
@@ -292,15 +299,18 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(result["effort"], "low")
 
     def test_check3_effort_not_allowed_for_backend(self):
-        # "max" is an anthropic-only effort; openrouter's glm doesn't allow it.
+        # "max" is no longer any backend's effort; openrouter's glm never allowed it anyway.
         responses = default_responses({
             ("GET", f"/repos/{REPOSITORY}/issues/comments/{COMMENT_ID}"): (
                 200, comment_body(body="@review glm max"),
             ),
         })
-        with self.assertRaises(trigger.VerifyFailure) as ctx:
-            self.run_verify(responses=responses)
-        self.assertEqual(ctx.exception.reason, "command:effort")
+        result = self.run_verify(responses=responses)
+        self.assertEqual(result["verified"], "false")
+        self.assertEqual(result["reason"], "command:effort")
+        self.assertEqual(result["help"], "true")
+        self.assertEqual(result["attempted_model"], "glm")
+        self.assertEqual(result["attempted_effort"], "max")
 
     def test_check3_unknown_model_rejected(self):
         responses = default_responses({
@@ -308,9 +318,11 @@ class VerifyTests(unittest.TestCase):
                 200, comment_body(body="@review gpt-9"),
             ),
         })
-        with self.assertRaises(trigger.VerifyFailure) as ctx:
-            self.run_verify(responses=responses)
-        self.assertEqual(ctx.exception.reason, "command:model")
+        result = self.run_verify(responses=responses)
+        self.assertEqual(result["verified"], "false")
+        self.assertEqual(result["reason"], "command:model")
+        self.assertEqual(result["help"], "true")
+        self.assertEqual(result["attempted_model"], "gpt-9")
 
     def test_check4_not_org_member(self):
         responses = default_responses({
@@ -401,6 +413,30 @@ class VerifyTests(unittest.TestCase):
 
     def test_check7_public_repo(self):
         responses = default_responses({
+            ("GET", f"/repos/{REPOSITORY}/pulls/{NUMBER}"): (200, pr_body(private=False)),
+        })
+        with self.assertRaises(trigger.VerifyFailure) as ctx:
+            self.run_verify(responses=responses)
+        self.assertEqual(ctx.exception.reason, "visibility:public")
+
+    # -- §10: non-command checks run first, so a bad command from a blocked request never helps --
+
+    def test_non_member_with_bad_command_gets_no_help(self):
+        responses = default_responses({
+            ("GET", f"/repos/{REPOSITORY}/issues/comments/{COMMENT_ID}"): (
+                200, comment_body(body="@review gpt-9"),
+            ),
+            ("GET", f"/orgs/{OWNER}/members/{LOGIN}"): (404, None),
+        })
+        with self.assertRaises(trigger.VerifyFailure) as ctx:
+            self.run_verify(responses=responses)
+        self.assertEqual(ctx.exception.reason, "membership:not_member")
+
+    def test_public_repo_with_bad_command_gets_no_help(self):
+        responses = default_responses({
+            ("GET", f"/repos/{REPOSITORY}/issues/comments/{COMMENT_ID}"): (
+                200, comment_body(body="@review gpt-9"),
+            ),
             ("GET", f"/repos/{REPOSITORY}/pulls/{NUMBER}"): (200, pr_body(private=False)),
         })
         with self.assertRaises(trigger.VerifyFailure) as ctx:

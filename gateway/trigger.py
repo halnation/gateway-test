@@ -10,16 +10,21 @@ mint"):
   step's `repositories:` input); on failure, `valid=false` plus a `reason`. Nothing else.
 - `run`: takes the already-minted Board App token and the bot login (derived by the workflow from
   the mint step's own `app-slug` output, e.g. `<slug>[bot]` -- never a hand-maintained var) and
-  runs the rest of the §3 checks in order through ONE injectable HTTP function (`http_request`),
-  so tests never hit the network: the comment fetch (+ its issue_url match), PR-and-open, the §8
-  command parse (`@review [MODEL] [EFFORT]`, resolved against `models.json` in this checkout),
-  org membership, recency (15 minutes, through an injectable clock), the paged/bot-scoped
-  idempotency marker (§7), and private-repo. An empty bot login is itself fatal
-  (`config:bot-login`) -- it is never treated as "idempotency doesn't apply". On success it writes
-  the contract's outputs to $GITHUB_OUTPUT (including the resolved `backend`/`model`/`effort`);
-  on any failure -- including an unexpected one, e.g. a network error or a non-JSON response -- it
-  writes `verified=false` plus a `reason` and exits 0 either way. It never echoes the comment
-  body, anywhere.
+  runs the rest of the §3 checks through ONE injectable HTTP function (`http_request`), so tests
+  never hit the network. §10: every non-command check runs FIRST -- the comment fetch (+ its
+  issue_url match), PR-and-open, org membership, recency (15 minutes, through an injectable
+  clock), the paged/bot-scoped idempotency marker (§7), and private-repo -- and the §8 command
+  parse (`@review [MODEL] [EFFORT]`, resolved against `models.json` in this checkout) runs LAST.
+  An empty bot login is itself fatal (`config:bot-login`) -- it is never treated as "idempotency
+  doesn't apply". On full success it writes the contract's outputs to $GITHUB_OUTPUT (including
+  the resolved `backend`/`model`/`effort`). §10: when every other check passes but the command
+  itself is malformed (`command:grammar`/`command:model`/`command:effort` -- never
+  `command:no_match`, which means the first token wasn't even `@review`), it writes
+  `verified=false`, the `reason`, `help=true`, and enough context (`repository`, `pr_number`,
+  `comment_id`, `requester`, `attempted_model`, `attempted_effort`) for the `help` job to post one
+  reply via `gateway/help_reply.py`. On any other failure -- including an unexpected one, e.g. a
+  network error or a non-JSON response -- it writes `verified=false` plus a `reason` and exits 0
+  either way. It never echoes the comment body, anywhere.
 """
 
 from __future__ import annotations
@@ -58,6 +63,17 @@ class VerifyFailure(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class CommandInvalid(VerifyFailure):
+    """§10: raised only for a genuine `@review` attempt with a bad grammar/model/effort -- NOT
+    for a first token that isn't `@review` at all (that's a plain VerifyFailure, no help owed).
+    Carries whatever attempted tokens exist, for help_reply.py to render."""
+
+    def __init__(self, reason: str, model_token: Optional[str] = None, effort_token: Optional[str] = None):
+        super().__init__(reason)
+        self.model_token = model_token
+        self.effort_token = effort_token
 
 
 def http_request(method: str, path: str, token: str) -> tuple[int, Optional[dict]]:
@@ -152,8 +168,10 @@ def parse_command(comment_body: str, models: dict) -> dict:
     lines = comment_body.splitlines()
     first_line = lines[0] if lines else ""
     tokens = first_line.strip().split()
-    if not tokens or tokens[0] != COMMAND_WORD or len(tokens) > 3:
+    if not tokens or tokens[0] != COMMAND_WORD:
         raise VerifyFailure("command:no_match")
+    if len(tokens) > 3:
+        raise CommandInvalid("command:grammar")
 
     model_token = tokens[1] if len(tokens) >= 2 else None
     effort_token = tokens[2] if len(tokens) >= 3 else None
@@ -165,7 +183,7 @@ def parse_command(comment_body: str, models: dict) -> dict:
     else:
         entry = next((m for m in models["models"].values() if m["model"] == model_token), None)
         if entry is None:
-            raise VerifyFailure("command:model")
+            raise CommandInvalid("command:model", model_token=model_token)
     backend = entry["backend"]
     model = entry["model"]
 
@@ -174,7 +192,7 @@ def parse_command(comment_body: str, models: dict) -> dict:
     elif effort_token in models["efforts"][backend]:
         effort = effort_token
     else:
-        raise VerifyFailure("command:effort")
+        raise CommandInvalid("command:effort", model_token=model_token, effort_token=effort_token)
 
     return {"command": "review", "backend": backend, "model": model, "effort": effort}
 
@@ -252,14 +270,30 @@ def verify(
     comment_id = inputs["comment_id"]
     owner = repository.split("/", 1)[0]
 
+    # §10: every non-command check runs FIRST; the command parse runs LAST, so a bad command on
+    # an otherwise-legitimate request can still get a help reply instead of silent nothing.
     comment = fetch_comment(http, token, repository, comment_id, number)
     pull_request = fetch_pull_request(http, token, repository, number)
-    parsed = parse_command(comment.get("body", ""), load_models())
     login = comment.get("user", {}).get("login", "")
     check_membership(http, token, owner, login)
     check_recency(comment.get("created_at", ""), clock)
     check_idempotency(http, token, repository, number, comment_id, comment.get("created_at", ""), bot_login)
     check_private(pull_request)
+
+    try:
+        parsed = parse_command(comment.get("body", ""), load_models())
+    except CommandInvalid as invalid:
+        return {
+            "verified": "false",
+            "reason": invalid.reason,
+            "help": "true",
+            "repository": repository,
+            "pr_number": number,
+            "comment_id": comment_id,
+            "requester": login,
+            "attempted_model": invalid.model_token or "",
+            "attempted_effort": invalid.effort_token or "",
+        }
 
     return {
         "verified": "true",
