@@ -239,7 +239,7 @@ jobs:
           path: out.md
 
   post:
-    needs: [prepare, review]
+    needs: [verify, prepare, review]
     runs-on: ubuntu-latest
     environment: gateway
     permissions:
