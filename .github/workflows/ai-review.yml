@@ -31,6 +31,14 @@ on:
         description: "resolved reasoning effort from gateway/models.json"
         required: true
         type: string
+    # Declared so secrets.X resolves inside this reusable workflow; each job's environment secret overrides it (GitHub docs, "Reusing workflows"). The caller passes nothing.
+    secrets:
+      BOARD_APP_PRIVATE_KEY:
+        required: false
+      OPENROUTER_API_KEY:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
 permissions: {}
 defaults:
   run:
