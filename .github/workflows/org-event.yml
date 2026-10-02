@@ -42,6 +42,12 @@ concurrency:
   group: org-event-${{ inputs.comment_id }}
   cancel-in-progress: false
 
+env:
+  # github-workflows@feat/ai-anthropic-effort, pinned 2026-10-01: adds
+  # anthropic thinking:adaptive + output_config.effort + refusal handling.
+  # Will be re-pinned to the squash-merge commit once that PR lands.
+  GW_REF: "c8544e5871accd888dd0e9a7b3062dea562a0f53"
+
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -123,24 +129,157 @@ jobs:
             echo "verify: failed ($REASON)"
           fi
 
-  review:
+  prepare:
     needs: verify
     if: needs.verify.outputs.verified == 'true'
-    # The caller caps the callee's GITHUB_TOKEN, not its App token (independent and minted
-    # per-job by the callee) -- so this grants only what the callee's own jobs declare for
-    # GITHUB_TOKEN, which is contents: read.
+    runs-on: ubuntu-latest
+    environment: gateway
     permissions:
       contents: read
-    uses: ./.github/workflows/ai-review.yml
-    with:
-      repository: ${{ needs.verify.outputs.repository }}
-      pr_number: ${{ needs.verify.outputs.pr_number }}
-      head_sha: ${{ needs.verify.outputs.head_sha }}
-      comment_id: ${{ needs.verify.outputs.comment_id }}
-      requester: ${{ needs.verify.outputs.requester }}
-      backend: ${{ needs.verify.outputs.backend }}
-      model: ${{ needs.verify.outputs.model }}
-      effort: ${{ needs.verify.outputs.effort }}
-    # No `secrets:` block: an Environment's secrets (BOARD_APP_PRIVATE_KEY, OPENROUTER_API_KEY)
-    # can't be passed through a workflow_call in the first place -- the callee's own jobs declare
-    # `environment:` themselves and pick their secrets up directly.
+    outputs:
+      backend: ${{ steps.resolve.outputs.backend }}
+      model: ${{ steps.resolve.outputs.model }}
+      effort: ${{ steps.resolve.outputs.effort }}
+    env:
+      REPOSITORY: ${{ needs.verify.outputs.repository }}
+      PR_NUMBER: ${{ needs.verify.outputs.pr_number }}
+      HEAD_SHA: ${{ needs.verify.outputs.head_sha }}
+      COMMENT_ID: ${{ needs.verify.outputs.comment_id }}
+      REQUESTER: ${{ needs.verify.outputs.requester }}
+      BACKEND: ${{ needs.verify.outputs.backend }}
+      MODEL: ${{ needs.verify.outputs.model }}
+      EFFORT: ${{ needs.verify.outputs.effort }}
+    steps:
+      - name: Validate input formats
+        run: |
+          [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "bad repository: $REPOSITORY"; exit 1; }
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "bad pr_number: $PR_NUMBER"; exit 1; }
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{7,40}$ ]] || { echo "bad head_sha: $HEAD_SHA"; exit 1; }
+          [[ "$COMMENT_ID" =~ ^[0-9]+$ ]] || { echo "bad comment_id: $COMMENT_ID"; exit 1; }
+          [[ "$REQUESTER" =~ ^[A-Za-z0-9-]{1,39}$ ]] || { echo "bad requester: $REQUESTER"; exit 1; }
+          [[ "$BACKEND" =~ ^[a-z]+$ ]] || { echo "bad backend: $BACKEND"; exit 1; }
+          [[ -n "$MODEL" ]] || { echo "bad model: empty"; exit 1; }
+          [[ "$EFFORT" =~ ^[a-z]+$ ]] || { echo "bad effort: $EFFORT"; exit 1; }
+      - name: Check out board-app (trusted code only, never the target repo)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Re-check backend/model/effort against this checkout's allowlist
+        id: resolve
+        run: |
+          resolved=$(python3 gateway/model_choice.py gateway/models.json "$BACKEND" "$MODEL" "$EFFORT")
+          echo "backend=$(jq -r .backend <<<"$resolved")" >> "$GITHUB_OUTPUT"
+          echo "model=$(jq -r .model <<<"$resolved")" >> "$GITHUB_OUTPUT"
+          echo "effort=$(jq -r .effort <<<"$resolved")" >> "$GITHUB_OUTPUT"
+      - name: Mint Board App token (contents read, pull_requests read) for the target repo
+        id: mint
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOARD_APP_ID }}
+          private-key: ${{ secrets.BOARD_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ env.REPOSITORY }}
+          permission-contents: read
+          permission-pull-requests: read
+      - name: Verify the PR head and fetch the diff for exactly head_sha
+        env:
+          GH_TOKEN: ${{ steps.mint.outputs.token }}
+        run: |
+          pr=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")
+          fresh_sha=$(jq -r .head.sha <<<"$pr")
+          base_sha=$(jq -r .base.sha <<<"$pr")
+          if [ "$fresh_sha" != "$HEAD_SHA" ]; then
+            echo "PR moved: expected $HEAD_SHA, found $fresh_sha"
+            exit 1
+          fi
+          gh api "repos/$REPOSITORY/compare/$base_sha...$HEAD_SHA" -H "Accept: application/vnd.github.v3.diff" > diff.txt
+      - name: Build input.txt
+        run: python3 gateway/ai_review_input.py diff.txt input.txt
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: ai-review-input
+          path: input.txt
+
+  review:
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: gateway-ai
+    permissions: {}
+    timeout-minutes: 15
+    steps:
+      - name: Check out github-workflows (public) at the pinned SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: TokenLogic-com-au/github-workflows
+          ref: ${{ env.GW_REF }}
+          path: gw
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ai-review-input
+      - name: Run ai.py review
+        env:
+          AI_API_STYLE: ${{ needs.prepare.outputs.backend == 'anthropic' && 'anthropic' || 'openai' }}
+          AI_API_URL: ${{ needs.prepare.outputs.backend == 'openrouter' && 'https://openrouter.ai/api/v1/chat/completions' || '' }}
+          AI_API_KEY: ${{ needs.prepare.outputs.backend == 'openrouter' && secrets.OPENROUTER_API_KEY || '' }}
+          ANTHROPIC_API_KEY: ${{ needs.prepare.outputs.backend == 'anthropic' && secrets.ANTHROPIC_API_KEY || '' }}
+          AI_MODEL: ${{ needs.prepare.outputs.model }}
+          AI_REASONING_EFFORT: ${{ needs.prepare.outputs.effort }}
+          AI_MAX_TOKENS: "16000"
+          AI_TIMEOUT: "600"
+          AI_RESPONSE_FORMAT: ${{ needs.prepare.outputs.backend == 'openrouter' && 'json_object' || '' }}
+          DRY_RUN: ${{ vars.AI_REVIEW_LIVE == 'true' && '0' || '1' }}
+        run: python3 gw/ai.py review input.txt out.md
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: ai-review-output
+          path: out.md
+
+  post:
+    needs: [prepare, review]
+    runs-on: ubuntu-latest
+    environment: gateway
+    permissions:
+      contents: read
+    env:
+      REPOSITORY: ${{ needs.verify.outputs.repository }}
+      PR_NUMBER: ${{ needs.verify.outputs.pr_number }}
+      HEAD_SHA: ${{ needs.verify.outputs.head_sha }}
+      COMMENT_ID: ${{ needs.verify.outputs.comment_id }}
+      REQUESTER: ${{ needs.verify.outputs.requester }}
+      # The resolved values from prepare's re-check, not the raw inputs --
+      # same reasoning as review's job (never trust the router's resolution
+      # over this checkout's own allowlist re-check), so the posted header
+      # always names the model/effort actually used for the API call.
+      MODEL: ${{ needs.prepare.outputs.model }}
+      EFFORT: ${{ needs.prepare.outputs.effort }}
+      DRY_RUN: ${{ vars.AI_REVIEW_LIVE == 'true' && '0' || '1' }}
+    steps:
+      - name: Check out board-app (trusted code only, never the target repo)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Mint Board App token (pull_requests write, contents none) for the target repo
+        id: mint
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOARD_APP_ID }}
+          private-key: ${{ secrets.BOARD_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ env.REPOSITORY }}
+          permission-contents: none
+          permission-pull-requests: write
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ai-review-output
+      - name: Render and upsert the review comment
+        env:
+          GH_TOKEN: ${{ steps.mint.outputs.token }}
+          BOARD_APP_BOT_LOGIN: ${{ steps.mint.outputs.app-slug }}[bot]
+        run: python3 gateway/ai_review_post.py out.md "$HEAD_SHA" "$REQUESTER" "$COMMENT_ID" "$REPOSITORY" "$PR_NUMBER" "$MODEL" "$EFFORT"
